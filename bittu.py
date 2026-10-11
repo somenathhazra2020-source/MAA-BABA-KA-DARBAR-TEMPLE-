@@ -529,7 +529,7 @@ _PG_PRIMARY_KEYS = {
     "daily_sankalp": ("email", "sankalp_date"), "mantra_sadhana": ("email",),
     "prasad_distribution": ("id",), "temple_events": ("id",),
     "admin_settings": ("key",), "room_visits": ("email", "room"),
-    "darshan_events": ("id",),
+    "darshan_events": ("id",), "japa_progress": ("email", "temple"),
 }
 
 
@@ -714,6 +714,16 @@ def init_db():
             room TEXT NOT NULL,
             visited_at TEXT NOT NULL,
             PRIMARY KEY(email,room)
+        )
+    """)
+    # Phase 3: persist in-progress mala separately for each devotee and temple.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS japa_progress(
+            email TEXT NOT NULL,
+            temple TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(email, temple)
         )
     """)
 
@@ -2175,10 +2185,10 @@ def temple_switcher():
     a,b=st.columns(2)
     with a:
         if st.button("🌺 Maa Durga Temple"+(" ✓" if cur=="durga" else ""),use_container_width=True,type="primary" if cur=="durga" else "secondary",key="g143_durga_temple"):
-            st.session_state.active_temple="durga"; st.session_state.japa=0; st.rerun()
+            st.session_state.active_temple="durga"; st.session_state.japa=load_japa_progress(st.session_state.email, "durga") if st.session_state.get("email") else 0; st.rerun()
     with b:
         if st.button("🔱 Mahadev Shiva Temple"+(" ✓" if cur=="shiva" else ""),use_container_width=True,type="primary" if cur=="shiva" else "secondary",key="g143_shiva_temple"):
-            st.session_state.active_temple="shiva"; st.session_state.japa=0; st.rerun()
+            st.session_state.active_temple="shiva"; st.session_state.japa=load_japa_progress(st.session_state.email, "shiva") if st.session_state.get("email") else 0; st.rerun()
 
 def upcoming_festivals_widget():
     today=india_now().date()
@@ -3099,10 +3109,48 @@ def aarti():
 # -----------------------------
 # JAPA
 # -----------------------------
+def load_japa_progress(email, temple):
+    """Read the saved partial mala for this devotee and temple."""
+    conn = db()
+    try:
+        row = conn.execute("SELECT count FROM japa_progress WHERE email=? AND temple=?", (email, temple)).fetchone()
+        return max(0, min(107, int(row["count"]))) if row else 0
+    finally:
+        conn.close()
+
+def save_japa_progress(email, temple, count):
+    """Persist partial progress; never store a completed 108-count mala here."""
+    count = max(0, min(107, int(count)))
+    conn = db()
+    try:
+        conn.execute("INSERT OR REPLACE INTO japa_progress(email,temple,count,updated_at) VALUES(?,?,?,?)",
+                     (email, temple, count, india_now().isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+
+def complete_japa_mala(email, temple):
+    """Write one completed mala to history and clear its saved partial progress."""
+    conn = db()
+    try:
+        conn.execute("INSERT INTO japa_history(email,count,created_at) VALUES(?,?,?)",
+                     (email, 108, india_now().strftime('%d %b %Y, %I:%M %p')))
+        conn.execute("INSERT OR REPLACE INTO japa_progress(email,temple,count,updated_at) VALUES(?,?,?,?)",
+                     (email, temple, 0, india_now().isoformat()))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 def japa():
     top_header(); temple_switcher()
     if not task_gate('japa'): return
-    temple=active_temple(); mantra=temple['mantra']; count=st.session_state.japa
+    temple=active_temple()
+    # Database is the source of truth across refreshes, sessions and devices.
+    st.session_state.japa = load_japa_progress(st.session_state.email, st.session_state.active_temple)
+    mantra=temple['mantra']; count=st.session_state.japa
     st.markdown(f"<div class='section-title'><h2>📿 {temple['short']} Japa Mala</h2><span>108 sacred repetitions • {mantra}</span></div>",unsafe_allow_html=True)
     japa_beads(count)
     st.markdown(f"<div class='japa-card'><div class='mala'>• • • • • • • • •</div><div style='font-size:52px;font-weight:800;color:#ffe3a0'>{count}/108</div><div class='mantra'>{mantra}</div><p style='color:#e7c987'>Chant with concentration and devotion.</p></div>",unsafe_allow_html=True)
@@ -3110,20 +3158,28 @@ def japa():
     with c2:
         if st.button('📿 CHANT',type='primary',use_container_width=True,key='g143_chant'):
             if not task_gate('japa'): return
-            if st.session_state.japa<108:
-                st.session_state.japa+=1
-                if st.session_state.japa==108:
-                    conn=db(); conn.execute('INSERT INTO japa_history(email,count,created_at) VALUES(?,?,?)',(st.session_state.email,108,india_now().strftime('%d %b %Y, %I:%M %p'))); conn.commit(); conn.close()
-                    st.success(f'108 Japa completed. {temple["greeting"]}')
-                else: st.rerun()
+            if st.session_state.japa < 107:
+                st.session_state.japa += 1
+                save_japa_progress(st.session_state.email, st.session_state.active_temple, st.session_state.japa)
+                st.rerun()
+            elif st.session_state.japa == 107:
+                complete_japa_mala(st.session_state.email, st.session_state.active_temple)
+                st.session_state.japa = 0
+                st.success(f'108 Japa completed and saved. {temple["greeting"]}')
+                st.rerun()
     c1,c2,c3=st.columns(3)
     with c1:
-        if st.button('Reset',use_container_width=True,key='g143_japa_reset'): st.session_state.japa=0; st.rerun()
+        if st.button('Reset',use_container_width=True,key='g143_japa_reset'):
+            st.session_state.japa=0
+            save_japa_progress(st.session_state.email, st.session_state.active_temple, 0)
+            st.rerun()
     with c2:
         if st.button('108 Complete',use_container_width=True,key='g143_japa_complete'):
             if not task_gate('japa'): return
-            st.session_state.japa=108
-            conn=db(); conn.execute('INSERT INTO japa_history(email,count,created_at) VALUES(?,?,?)',(st.session_state.email,108,india_now().strftime('%d %b %Y, %I:%M %p'))); conn.commit(); conn.close(); st.success(f'Mala completed. {temple["greeting"]}')
+            complete_japa_mala(st.session_state.email, st.session_state.active_temple)
+            st.session_state.japa=0
+            st.success(f'Mala completed and saved. {temple["greeting"]}')
+            st.rerun()
     with c3:
         if st.button('← Home',use_container_width=True,key='g143_japa_home'): go('home')
 
